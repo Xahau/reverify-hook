@@ -1,0 +1,258 @@
+name: Re-verify Hook on Hookstore
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      sourceRef:
+        description: 'Source reference (tag/branch/commit) - defaults to current ref'
+        required: false
+        type: string
+      force:
+        description: 'Force re-verification even if source SHA unchanged'
+        required: false
+        type: boolean
+        default: false
+      create_if_missing:
+        description: 'Create a new release if hook exists but release does not (useful for auto-publishing new versions)'
+        required: false
+        type: boolean
+        default: false
+      wait_for_completion:
+        description: 'Wait for verification to complete (polls status every 30s, useful for CI/CD gates)'
+        required: false
+        type: boolean
+        default: false
+      timeout:
+        description: 'Maximum time to wait for completion in seconds (default: 600 = 10 minutes)'
+        required: false
+        type: number
+        default: 600
+
+jobs:
+  reverify:
+    name: Trigger Hook Re-verification
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine source reference
+        id: source_ref
+        run: |
+          # Use manual input if provided, otherwise detect from context
+          if [ -n "${{ inputs.sourceRef }}" ]; then
+            SOURCE_REF="${{ inputs.sourceRef }}"
+            echo "Using manual sourceRef: $SOURCE_REF"
+          elif [ "${{ github.event_name }}" = "release" ]; then
+            # Release event - use tag name
+            SOURCE_REF="${{ github.event.release.tag_name }}"
+            echo "Using release tag: $SOURCE_REF"
+          elif [ "${{ github.ref_type }}" = "tag" ]; then
+            # Tag push - use tag name
+            SOURCE_REF="${{ github.ref_name }}"
+            echo "Using pushed tag: $SOURCE_REF"
+          else
+            # Fallback to current commit SHA
+            SOURCE_REF="${{ github.sha }}"
+            echo "Using commit SHA: $SOURCE_REF"
+          fi
+          
+          echo "source_ref=$SOURCE_REF" >> $GITHUB_OUTPUT
+          echo "📌 Source reference: $SOURCE_REF"
+
+      - name: Get repository URL
+        id: repo
+        run: |
+          # Get the repository URL in standard format
+          REPO_URL="${{ github.server_url }}/${{ github.repository }}"
+          echo "repo_url=$REPO_URL" >> $GITHUB_OUTPUT
+          echo "📦 Repository: $REPO_URL"
+
+      - name: Trigger re-verification
+        id: reverify
+        run: |
+          echo "🚀 Triggering re-verification..."
+          echo "Repository: ${{ steps.repo.outputs.repo_url }}"
+          echo "Source Ref: ${{ steps.source_ref.outputs.source_ref }}"
+          echo "Force: ${{ inputs.force || 'false' }}"
+          echo "Create if Missing: ${{ inputs.create_if_missing || 'false' }}"
+          
+          # Make API call to trigger re-verification (public API endpoint)
+          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+            "${{ secrets.HOOKSTORE_API_URL || 'https://api.hookstore.xahau.network' }}/reverify" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer ${{ secrets.HOOKSTORE_API_KEY }}" \
+            -d '{
+              "repoUrl": "${{ steps.repo.outputs.repo_url }}",
+              "sourceRef": "${{ steps.source_ref.outputs.source_ref }}",
+              "force": ${{ inputs.force || false }},
+              "createIfMissing": ${{ inputs.create_if_missing || false }}
+            }')
+          
+          # Extract HTTP status code (last line)
+          HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+          # Extract response body (everything except last line)
+          BODY=$(echo "$RESPONSE" | sed '$d')
+          
+          echo "HTTP Status: $HTTP_CODE"
+          echo "Response: $BODY"
+          
+          # Check if request was successful
+          if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+            echo "✅ Re-verification triggered successfully"
+            echo "response=$BODY" >> $GITHUB_OUTPUT
+            
+            # Extract hook slug and semver for polling
+            HOOK_SLUG=$(echo "$BODY" | jq -r '.hookSlug // empty' 2>/dev/null || echo "")
+            SEMVER=$(echo "$BODY" | jq -r '.semver // empty' 2>/dev/null || echo "")
+            
+            if [ -n "$HOOK_SLUG" ] && [ -n "$SEMVER" ]; then
+              echo "hook_slug=$HOOK_SLUG" >> $GITHUB_OUTPUT
+              echo "semver=$SEMVER" >> $GITHUB_OUTPUT
+              echo "📦 Hook: $HOOK_SLUG@$SEMVER"
+            fi
+            
+            # Try to extract hook hash(es) from response
+            HOOK_HASHES=$(echo "$BODY" | jq -r '.hooks[]?.hookHash // empty' 2>/dev/null || echo "")
+            if [ -n "$HOOK_HASHES" ]; then
+              echo "🔐 Hook Hashes:"
+              echo "$HOOK_HASHES" | while read -r hash; do
+                echo "  - $hash"
+              done
+            fi
+          else
+            echo "❌ Re-verification failed with status $HTTP_CODE"
+            echo "Response: $BODY"
+            exit 1
+          fi
+
+      - name: Wait for verification completion
+        if: success() && inputs.wait_for_completion
+        id: wait
+        run: |
+          HOOK_SLUG="${{ steps.reverify.outputs.hook_slug }}"
+          SEMVER="${{ steps.reverify.outputs.semver }}"
+          TIMEOUT=${{ inputs.timeout || 600 }}
+          POLL_INTERVAL=30
+          API_URL="${{ secrets.HOOKSTORE_API_URL || 'https://api.hookstore.xahau.network' }}"
+          
+          if [ -z "$HOOK_SLUG" ] || [ -z "$SEMVER" ]; then
+            echo "⚠️ Could not extract hook slug or semver from response. Skipping polling."
+            exit 0
+          fi
+          
+          echo "⏳ Waiting for verification to complete..."
+          echo "📦 Hook: $HOOK_SLUG@$SEMVER"
+          echo "⏱️ Timeout: ${TIMEOUT}s (polling every ${POLL_INTERVAL}s)"
+          echo ""
+          
+          START_TIME=$(date +%s)
+          ELAPSED=0
+          
+          while [ $ELAPSED -lt $TIMEOUT ]; do
+            # Poll status endpoint (public API, no auth needed)
+            STATUS_RESPONSE=$(curl -s "$API_URL/hooks/$HOOK_SLUG/releases/$SEMVER/verification-status" || echo "{}")
+            STATUS=$(echo "$STATUS_RESPONSE" | jq -r '.status // "unknown"')
+            VERIFIED=$(echo "$STATUS_RESPONSE" | jq -r '.verified // false')
+            ERROR=$(echo "$STATUS_RESPONSE" | jq -r '.verifyError // empty')
+            
+            CURRENT_TIME=$(date +%s)
+            ELAPSED=$((CURRENT_TIME - START_TIME))
+            
+            echo "[${ELAPSED}s] Status: $STATUS"
+            
+            case "$STATUS" in
+              verified)
+                echo "✅ Verification completed successfully!"
+                echo "status=$STATUS" >> $GITHUB_OUTPUT
+                echo "verified=true" >> $GITHUB_OUTPUT
+                exit 0
+                ;;
+              failed|invalidated)
+                echo "❌ Verification failed: $STATUS"
+                if [ -n "$ERROR" ]; then
+                  echo "Error: $ERROR"
+                  echo "error=$ERROR" >> $GITHUB_OUTPUT
+                fi
+                echo "status=$STATUS" >> $GITHUB_OUTPUT
+                echo "verified=false" >> $GITHUB_OUTPUT
+                exit 1
+                ;;
+              building|unverified)
+                # Still in progress, continue polling
+                echo "⏳ Still building... (${ELAPSED}/${TIMEOUT}s)"
+                ;;
+              *)
+                echo "⚠️ Unknown status: $STATUS"
+                ;;
+            esac
+            
+            # Wait before next poll
+            sleep $POLL_INTERVAL
+            ELAPSED=$((CURRENT_TIME + POLL_INTERVAL - START_TIME))
+          done
+          
+          echo "⏱️ Timeout reached after ${TIMEOUT}s"
+          echo "❌ Verification did not complete in time. Final status: $STATUS"
+          echo "🔍 Check status manually at: https://console.hookstore.dev"
+          echo "status=timeout" >> $GITHUB_OUTPUT
+          echo "verified=false" >> $GITHUB_OUTPUT
+          exit 1
+      
+      - name: Verification summary (no wait)
+        if: success() && !inputs.wait_for_completion
+        run: |
+          echo "⏳ Verification initiated. Check status at:"
+          echo "🌐 https://console.hookstore.dev/hooks?repo=${{ github.repository }}"
+          echo ""
+          echo "💡 Tip: Use 'wait_for_completion: true' to block until verification completes."
+          echo "Note: Verification may take several minutes depending on hook complexity."
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "## Re-verification Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Repository:** ${{ steps.repo.outputs.repo_url }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Source Ref:** ${{ steps.source_ref.outputs.source_ref }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Force:** ${{ inputs.force || 'false' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Create if Missing:** ${{ inputs.create_if_missing || 'false' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Wait for Completion:** ${{ inputs.wait_for_completion || 'false' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Status:** ${{ job.status }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ job.status }}" = "success" ]; then
+            if [ "${{ inputs.wait_for_completion }}" = "true" ]; then
+              WAIT_STATUS="${{ steps.wait.outputs.status || 'unknown' }}"
+              VERIFIED="${{ steps.wait.outputs.verified || 'false' }}"
+              
+              if [ "$VERIFIED" = "true" ]; then
+                echo "✅ Verification completed successfully" >> $GITHUB_STEP_SUMMARY
+              elif [ "$WAIT_STATUS" = "timeout" ]; then
+                echo "⏱️ Verification timed out (still building)" >> $GITHUB_STEP_SUMMARY
+                echo "" >> $GITHUB_STEP_SUMMARY
+                echo "Check progress at: https://console.hookstore.dev/hooks?repo=${{ github.repository }}" >> $GITHUB_STEP_SUMMARY
+              else
+                echo "❌ Verification failed: $WAIT_STATUS" >> $GITHUB_STEP_SUMMARY
+                if [ -n "${{ steps.wait.outputs.error }}" ]; then
+                  echo "" >> $GITHUB_STEP_SUMMARY
+                  echo "**Error:** ${{ steps.wait.outputs.error }}" >> $GITHUB_STEP_SUMMARY
+                fi
+              fi
+            else
+              echo "✅ Re-verification triggered successfully" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "Check progress at: https://console.hookstore.dev/hooks?repo=${{ github.repository }}" >> $GITHUB_STEP_SUMMARY
+            fi
+          else
+            echo "❌ Re-verification failed" >> $GITHUB_STEP_SUMMARY
+          fi
+
