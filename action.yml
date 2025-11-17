@@ -70,6 +70,10 @@ runs:
           # Fallback: try to read from manifest, otherwise use commit SHA
           if [ -f "hookstore.manifest.json" ]; then
             MANIFEST_VERSION=$(jq -r '.version // empty' hookstore.manifest.json 2>/dev/null || echo "")
+            # Check if manifest targets mainnet
+            MANIFEST_NETWORKS=$(jq -r '.networks // []' hookstore.manifest.json 2>/dev/null || echo "[]")
+            IS_MAINNET=$(echo "$MANIFEST_NETWORKS" | jq -r 'any(. == "xahau-mainnet" or . == "XAHAU_MAINNET")' 2>/dev/null || echo "false")
+            
             if [ -n "$MANIFEST_VERSION" ]; then
               # Try to find a tag matching the version
               if git rev-parse "v$MANIFEST_VERSION" >/dev/null 2>&1; then
@@ -79,18 +83,46 @@ runs:
                 SOURCE_REF="$MANIFEST_VERSION"
                 echo "Using tag matching manifest version: $SOURCE_REF"
               else
-                # No matching tag, use default branch (manifest version will be used for semver)
+                # No matching tag found
+                if [ "$IS_MAINNET" = "true" ]; then
+                  echo "⚠️ WARNING: Manifest targets mainnet but no matching tag found for version $MANIFEST_VERSION"
+                  echo "⚠️ Mainnet releases require git tags. Please create a tag:"
+                  echo "   git tag v$MANIFEST_VERSION && git push origin v$MANIFEST_VERSION"
+                  echo "⚠️ Falling back to commit SHA, but this will fail for mainnet releases"
+                fi
+                # Use default branch (will fail validation for mainnet, but allow testnet)
                 SOURCE_REF="main"
                 echo "Using default branch (manifest version: $MANIFEST_VERSION will be used for semver)"
+                if [ "$IS_MAINNET" = "true" ]; then
+                  echo "⚠️ NOTE: This will fail validation for mainnet releases. Use a git tag instead."
+                fi
               fi
             else
+              if [ "$IS_MAINNET" = "true" ]; then
+                echo "⚠️ WARNING: Manifest targets mainnet but no version found in manifest"
+                echo "⚠️ Mainnet releases require git tags. Please specify source_ref input with a tag name"
+              fi
               SOURCE_REF="${{ github.sha }}"
               echo "Using commit SHA: $SOURCE_REF"
+              if [ "$IS_MAINNET" = "true" ]; then
+                echo "⚠️ NOTE: This will fail validation for mainnet releases. Use a git tag instead."
+              fi
             fi
           else
             SOURCE_REF="${{ github.sha }}"
             echo "Using commit SHA: $SOURCE_REF"
+            echo "⚠️ NOTE: If your hook targets mainnet, this will fail. Use a git tag instead."
           fi
+        fi
+        
+        # Validate sourceRef format for mainnet (heuristic check)
+        # Check if it looks like a commit SHA (40 hex chars) or common branch name
+        if echo "$SOURCE_REF" | grep -qE '^[0-9a-f]{40}$' -i; then
+          echo "⚠️ WARNING: Source reference appears to be a commit SHA"
+          echo "⚠️ If your hook targets mainnet, this will be rejected. Use a git tag instead."
+        elif echo "$SOURCE_REF" | grep -qE '^(main|master|develop|dev|staging|production|prod)$' -i; then
+          echo "⚠️ WARNING: Source reference appears to be a branch name"
+          echo "⚠️ If your hook targets mainnet, this will be rejected. Use a git tag instead."
         fi
         
         echo "source_ref=$SOURCE_REF" >> $GITHUB_OUTPUT
@@ -240,5 +272,4 @@ runs:
         echo "status=timeout" >> $GITHUB_OUTPUT
         echo "verified=false" >> $GITHUB_OUTPUT
         exit 1
-
 
